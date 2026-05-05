@@ -18,22 +18,79 @@ from __future__ import annotations
 # ---------------------------------------------------------------------------
 # Стандартная библиотека
 # ---------------------------------------------------------------------------
+import sys
+import subprocess
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, colorchooser
 from tkinter.scrolledtext import ScrolledText
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Callable, Iterable
+import datetime
+import time
+
 
 # ---------------------------------------------------------------------------
-# Сторонние библиотеки (odfpy / python3-odf)
+# Проверка и установка зависимостей
 # ---------------------------------------------------------------------------
-from odf.opendocument import load as odf_load, OpenDocumentSpreadsheet
-from odf.table import Table, TableRow, TableCell
-from odf.text import P
-from odf import style, namespaces
-from odf.style import Style, TextProperties, TableCellProperties
-from odf.namespaces import OFFICENS, STYLENS, FONS
+
+_MISSING_DEPS: list[str] = []
+
+try:
+    from odf.opendocument import load as odf_load, OpenDocumentSpreadsheet
+    from odf.table import Table, TableRow, TableCell
+    from odf.text import P
+    from odf import style, namespaces
+    from odf.style import Style, TextProperties, TableCellProperties, FontFace
+    from odf.namespaces import OFFICENS, STYLENS, FONS, SVGNS
+except ImportError:
+    _MISSING_DEPS.append("python3-odf  (pip: odfpy)")
+
+
+def _check_deps_and_install() -> bool:
+    if not _MISSING_DEPS:
+        return True
+    deps_list = "\n".join(f"  • {d}" for d in _MISSING_DEPS)
+    msg = (
+        "Не найдены обязательные зависимости:\n"
+        f"{deps_list}\n\n"
+        "Установить автоматически?\n"
+        "• «apt» — системная установка (требует sudo)\n"
+        "• «pip» — установка в текущее окружение\n"
+        "• «Нет» — выйти для ручной установки"
+    )
+    root = tk.Tk()
+    root.withdraw()
+    result = messagebox.askyesnocancel("Зависимости не найдены", msg)
+    root.destroy()
+
+    if result is None or result is False and not messagebox.askyesno(
+        "Выход", "Установите зависимости вручную и перезапустите.\nВыйти?"
+    ):
+        sys.exit(1)
+
+    if result is True:
+        try:
+            subprocess.run(
+                ["sudo", "apt", "install", "-y", "python3-odf"],
+                check=True,
+            )
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            try:
+                subprocess.run(
+                    [sys.executable, "-m", "pip", "install", "odfpy"],
+                    check=True,
+                )
+            except (subprocess.CalledProcessError, FileNotFoundError):
+                messagebox.showerror(
+                    "Ошибка",
+                    "Не удалось установить зависимости.\n"
+                    "Установите вручную: sudo apt install python3-odf",
+                )
+                sys.exit(1)
+        return True
+
+    sys.exit(1)
 
 
 # ===========================================================================
@@ -50,12 +107,13 @@ class FileInfo:
 @dataclass
 class CellData:
     """Данные одной ячейки: значение и параметры форматирования текста."""
-    value: str              # строковое представление значения ячейки
+    value: str
     font_name: str
     font_size: int
     bold: bool
     italic: bool
-    color: str              # hex "#RRGGBB"; "" если не задан
+    underline: bool
+    color: str
 
 
 @dataclass
@@ -69,12 +127,13 @@ class SheetData:
 @dataclass
 class CellDelta:
     """Изменения одной ячейки. None означает «значение не менялось»."""
-    value: str | None          # None — значение не менялось
+    value: str | None
     font_name: str | None
     font_size: int | None
     bold: bool | None
     italic: bool | None
-    color: str | None          # hex-строка вида "#RRGGBB" или None
+    underline: bool | None
+    color: str | None
 
 
 @dataclass
@@ -103,22 +162,43 @@ class AppState:
 # ===========================================================================
 
 class LogStore:
-    """Хранит записи лога в памяти (без записи на диск)."""
+    """Хранит записи лога в памяти и дублирует в файл."""
 
     def __init__(self) -> None:
         self._entries: list[str] = []
+        self._log_dir = Path.home() / ".ods_bulk_editor"
+        try:
+            self._log_dir.mkdir(parents=True, exist_ok=True)
+            ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            self._log_path = self._log_dir / f"session_{ts}.log"
+            self._log_file = open(self._log_path, "a", encoding="utf-8")
+        except OSError:
+            self._log_path = None
+            self._log_file = None
 
     def add(self, message: str) -> None:
-        """Добавить запись в лог."""
-        self._entries.append(message)
+        ts = datetime.datetime.now().strftime("%H:%M:%S")
+        entry = f"[{ts}] {message}"
+        self._entries.append(entry)
+        if self._log_file:
+            try:
+                self._log_file.write(entry + "\n")
+                self._log_file.flush()
+            except OSError:
+                pass
 
     def get_all(self) -> list[str]:
-        """Вернуть все записи лога."""
         return list(self._entries)
 
     def clear(self) -> None:
-        """Очистить лог."""
         self._entries.clear()
+
+    def close(self) -> None:
+        if self._log_file:
+            try:
+                self._log_file.close()
+            except OSError:
+                pass
 
 
 # ===========================================================================
@@ -300,6 +380,7 @@ class OdsReader:
                     font_size=fmt["font_size"],
                     bold=fmt["bold"],
                     italic=fmt["italic"],
+                    underline=fmt["underline"],
                     color=fmt["color"],
                 )
 
@@ -356,6 +437,7 @@ class OdsReader:
             "font_size": 11,
             "bold": False,
             "italic": False,
+            "underline": False,
             "color": "",
         }
 
@@ -408,6 +490,9 @@ class OdsReader:
                     fi = tp.getAttrNS(FONS, "font-style")
                     if fi:
                         result["italic"] = (fi == "italic")
+                    uus = tp.getAttrNS(STYLENS, "text-underline-style")
+                    if uus and uus != "none":
+                        result["underline"] = True
                     color = tp.getAttrNS(FONS, "color")
                     if color:
                         result["color"] = color
@@ -452,7 +537,7 @@ class Processor:
                     continue
                 cell = row_cells[col_idx]
 
-                self._apply_delta_to_cell(cell, cell_delta, doc)
+                self._apply_delta_to_cell(cell, cell_delta, doc, log)
 
             doc.save(str(path))
             return True
@@ -460,143 +545,118 @@ class Processor:
             log.add(f"Ошибка обработки файла {path.name}: {e}")
             return False
 
-    def _apply_delta_to_cell(self, cell, cell_delta: CellDelta, doc) -> None:
+    def _apply_delta_to_cell(self, cell, cell_delta: CellDelta, doc, log: LogStore) -> None:
         """Применяет изменения дельты к ячейке."""
-        # Apply value change
         if cell_delta.value is not None:
-            # Remove formula attribute if present
-            try:
-                cell.removeAttribute("formula")
-            except Exception:
-                pass
-            # Remove existing paragraphs
+            for attr in ["formula", "valuetype", "value", "datevalue"]:
+                try:
+                    cell.removeAttribute(attr)
+                except Exception:
+                    pass
             for p in list(cell.getElementsByType(P)):
                 cell.removeChild(p)
-            # Remove value-type and value attributes (convert to string)
-            try:
-                cell.removeAttribute("valuetype")
-            except Exception:
-                pass
-            try:
-                cell.removeAttribute("value")
-            except Exception:
-                pass
-            try:
-                cell.removeAttribute("datevalue")
-            except Exception:
-                pass
-            # Set value-type to string
+
             cell.setAttrNS(OFFICENS, "value-type", "string")
-            # Create new paragraph with value
             p = P(text=cell_delta.value)
             cell.addElement(p)
 
-        # Apply formatting change
         has_formatting = any([
             cell_delta.font_name is not None,
             cell_delta.font_size is not None,
             cell_delta.bold is not None,
             cell_delta.italic is not None,
+            cell_delta.underline is not None,
             cell_delta.color is not None,
         ])
 
         if has_formatting:
-            # Get or create paragraph
-            paragraphs = cell.getElementsByType(P)
-            if not paragraphs:
-                p = P(text="")
-                cell.addElement(p)
-                paragraphs = [p]
-            p = paragraphs[0]
-
-            # Get existing style name or create new one
-            existing_style_name = p.getAttrNS(namespaces.TEXTNS, "style-name")
-            style_name = self._get_or_create_text_style(
-                doc,
-                existing_style_name,
-                cell_delta,
+            existing_style_name = cell.getAttrNS(namespaces.TABLENS, "style-name")
+            new_style_name = self._get_or_create_table_cell_style(
+                doc, existing_style_name, cell_delta
             )
-            p.setAttrNS(namespaces.TEXTNS, "style-name", style_name)
 
-    def _get_or_create_text_style(
-        self,
-        doc,
-        existing_style_name: str | None,
-        cell_delta: CellDelta,
+            cell.setAttrNS(namespaces.TABLENS, "style-name", new_style_name)
+
+            for p in cell.getElementsByType(P):
+                for attr in list(p.attributes.keys()):
+                    if attr[1] == "style-name":
+                        del p.attributes[attr]
+
+            log.add(f"  Стиль для ячейки: {new_style_name}")
+
+    def _get_or_create_table_cell_style(
+        self, doc, existing_style_name: str | None, cell_delta: CellDelta
     ) -> str:
-        """
-        Создаёт или обновляет именованный стиль текста с параметрами форматирования.
-        Возвращает имя стиля.
-        """
-        # Build a unique style name based on formatting parameters
-        # First, read existing style properties if any
-        existing_props: dict = {}
-        if existing_style_name:
-            all_styles = list(doc.automaticstyles.getElementsByType(Style))
-            for s in all_styles:
-                if s.getAttrNS(STYLENS, "name") == existing_style_name:
-                    text_props = s.getElementsByType(TextProperties)
-                    if text_props:
-                        tp = text_props[0]
-                        fn = tp.getAttrNS(STYLENS, "font-name")
-                        if fn:
-                            existing_props["font_name"] = fn
-                        fs = tp.getAttrNS(FONS, "font-size")
-                        if fs:
-                            try:
-                                existing_props["font_size"] = int(float(str(fs).replace("pt", "").strip()))
-                            except (ValueError, AttributeError):
-                                pass
-                        fw = tp.getAttrNS(FONS, "font-weight")
-                        if fw:
-                            existing_props["bold"] = (fw == "bold")
-                        fi = tp.getAttrNS(FONS, "font-style")
-                        if fi:
-                            existing_props["italic"] = (fi == "italic")
-                        color = tp.getAttrNS(FONS, "color")
-                        if color:
-                            existing_props["color"] = color
-                    break
+        fn = str(cell_delta.font_name).replace(' ', '')
+        fs = str(cell_delta.font_size)
+        b = str(cell_delta.bold)
+        i = str(cell_delta.italic)
+        u = str(cell_delta.underline)
+        c = str(cell_delta.color).replace('#', '')
 
-        # Merge: delta overrides existing
-        font_name = cell_delta.font_name if cell_delta.font_name is not None else existing_props.get("font_name", "")
-        font_size = cell_delta.font_size if cell_delta.font_size is not None else existing_props.get("font_size", 11)
-        bold = cell_delta.bold if cell_delta.bold is not None else existing_props.get("bold", False)
-        italic = cell_delta.italic if cell_delta.italic is not None else existing_props.get("italic", False)
-        color = cell_delta.color if cell_delta.color is not None else existing_props.get("color", "")
+        style_name = f"Ce_{existing_style_name or 'Def'}_{fn}_{fs}_{b}_{i}_{u}_{c}"
 
-        # Create a unique style name
-        style_name = f"T_{font_name}_{font_size}_{int(bold)}_{int(italic)}_{color.replace('#', '')}"
-
-        # Check if style already exists
         all_styles = list(doc.automaticstyles.getElementsByType(Style))
         for s in all_styles:
             if s.getAttrNS(STYLENS, "name") == style_name:
                 return style_name
 
-        # Create new style
-        new_style = Style(name=style_name, family="text")
-        tp_attrs = {}
-        if font_name:
-            tp_attrs["fontname"] = font_name
-        if font_size:
-            tp_attrs["fontsize"] = f"{font_size}pt"
-        if bold:
-            tp_attrs["fontweight"] = "bold"
-        else:
-            tp_attrs["fontweight"] = "normal"
-        if italic:
-            tp_attrs["fontstyle"] = "italic"
-        else:
-            tp_attrs["fontstyle"] = "normal"
-        if color:
-            tp_attrs["color"] = color
+        if cell_delta.font_name:
+            self._ensure_font_face(doc, cell_delta.font_name)
 
-        tp = TextProperties(**tp_attrs)
+        new_style = Style(name=style_name, family="table-cell")
+
+        if existing_style_name:
+            new_style.setAttrNS(STYLENS, "parent-style-name", existing_style_name)
+
+        tp = TextProperties()
+
+        if cell_delta.font_size is not None:
+            tp.setAttrNS(FONS, "font-size", f"{cell_delta.font_size}pt")
+
+        if cell_delta.bold is not None:
+            tp.setAttrNS(FONS, "font-weight", "bold" if cell_delta.bold else "normal")
+
+        if cell_delta.italic is not None:
+            tp.setAttrNS(FONS, "font-style", "italic" if cell_delta.italic else "normal")
+
+        if cell_delta.font_name:
+            tp.setAttrNS(STYLENS, "font-name", cell_delta.font_name)
+            tp.setAttrNS(FONS, "font-family", f"'{cell_delta.font_name}'")
+
+        if cell_delta.underline is not None:
+            if cell_delta.underline:
+                tp.setAttrNS(STYLENS, "text-underline-style", "solid")
+                tp.setAttrNS(STYLENS, "text-underline-type", "single")
+            else:
+                tp.setAttrNS(STYLENS, "text-underline-style", "none")
+
+        if cell_delta.color:
+            tp.setAttrNS(FONS, "color", cell_delta.color)
+
         new_style.addElement(tp)
         doc.automaticstyles.addElement(new_style)
 
         return style_name
+
+    @staticmethod
+    def _ensure_font_face(doc, font_name: str) -> None:
+        try:
+            font_faces = doc.fontfacedecls.getElementsByType(FontFace)
+            for ff in font_faces:
+                if ff.getAttrNS(STYLENS, "name") == font_name:
+                    return
+        except AttributeError:
+            return
+
+        ff = FontFace(name=font_name)
+        ff.setAttrNS(STYLENS, "name", font_name)
+        ff.setAttrNS(SVGNS, "font-family", f"'{font_name}'")
+        ff.setAttrNS(STYLENS, "font-pitch", "variable")
+        try:
+            doc.fontfacedecls.addElement(ff)
+        except AttributeError:
+            pass
 
     def apply_bulk(
         self,
@@ -638,46 +698,84 @@ class Processor:
 # ===========================================================================
 
 
-class LogPanel(tk.Frame):
+class BottomPanel(tk.Frame):
     """
-    Панель лога в нижней части MainWindow.
-    Отображает записи LogStore в ScrolledText (только для чтения).
+    Нижняя панель с вкладками:
+      — «Текст ячейки»: полное содержимое выбранной ячейки (редактируемое).
+      — «Лог»: записи LogStore.
     """
 
     def __init__(self, parent: tk.Widget, log: "LogStore", **kwargs) -> None:
         super().__init__(parent, **kwargs)
         self._log = log
+        self._on_cell_text_save: Callable[[], None] | None = None
+        self._building = False
         self._build_ui()
 
     def _build_ui(self) -> None:
-        label = tk.Label(self, text="Лог:", anchor="w")
-        label.pack(fill=tk.X, padx=4, pady=(4, 0))
+        self._notebook = ttk.Notebook(self)
+        self._notebook.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
 
-        self._text = ScrolledText(self, height=6, state=tk.DISABLED, wrap=tk.WORD)
-        self._text.pack(fill=tk.BOTH, expand=True, padx=4, pady=(0, 4))
+        # ── Вкладка «Текст ячейки» ────────────────────────────────────────
+        cell_frame = tk.Frame(self._notebook)
+        self._notebook.add(cell_frame, text=" Текст ячейки ")
 
-    def refresh(self) -> None:
-        """Перечитать LogStore и обновить отображение."""
-        self._text.config(state=tk.NORMAL)
-        self._text.delete("1.0", tk.END)
+        btn_frame = tk.Frame(cell_frame)
+        btn_frame.pack(fill=tk.X)
+        self._btn_apply_text = tk.Button(
+            btn_frame, text="Применить", command=self._save_cell_text,
+        )
+        self._btn_apply_text.pack(side=tk.RIGHT, padx=2, pady=2)
+
+        self._cell_text = ScrolledText(
+            cell_frame, height=6, wrap=tk.WORD, font=("Consolas", 10),
+        )
+        self._cell_text.pack(fill=tk.BOTH, expand=True)
+        self._cell_text.bind("<Control-Return>", lambda e: self._save_cell_text())
+
+        # ── Вкладка «Лог» ──────────────────────────────────────────────────
+        log_frame = tk.Frame(self._notebook)
+        self._notebook.add(log_frame, text=" Лог ")
+        self._log_text = ScrolledText(
+            log_frame, height=6, state=tk.DISABLED, wrap=tk.WORD,
+        )
+        self._log_text.pack(fill=tk.BOTH, expand=True)
+
+    def set_cell_text_callback(self, callback: Callable[[], None]) -> None:
+        self._on_cell_text_save = callback
+
+    def _save_cell_text(self) -> None:
+        if self._on_cell_text_save:
+            self._on_cell_text_save()
+
+    def get_cell_text(self) -> str:
+        return self._cell_text.get("1.0", tk.END).rstrip("\n")
+
+    def refresh_log(self) -> None:
+        self._log_text.config(state=tk.NORMAL)
+        self._log_text.delete("1.0", tk.END)
         entries = self._log.get_all()
         if entries:
-            self._text.insert(tk.END, "\n".join(entries))
-        self._text.config(state=tk.DISABLED)
-        # Scroll to end
-        self._text.see(tk.END)
+            self._log_text.insert(tk.END, "\n".join(entries))
+        self._log_text.config(state=tk.DISABLED)
+        self._log_text.see(tk.END)
 
-    def append(self, message: str) -> None:
-        """Добавить одну запись в лог (без полного перечитывания)."""
+    def append_log(self, message: str) -> None:
         self._log.add(message)
-        self._text.config(state=tk.NORMAL)
-        current = self._text.get("1.0", tk.END).rstrip("\n")
+        self._log_text.config(state=tk.NORMAL)
+        current = self._log_text.get("1.0", tk.END).rstrip("\n")
         if current:
-            self._text.insert(tk.END, "\n" + message)
+            self._log_text.insert(tk.END, "\n" + message)
         else:
-            self._text.insert(tk.END, message)
-        self._text.config(state=tk.DISABLED)
-        self._text.see(tk.END)
+            self._log_text.insert(tk.END, message)
+        self._log_text.config(state=tk.DISABLED)
+        self._log_text.see(tk.END)
+
+    def show_cell_content(self, text: str) -> None:
+        self._building = True
+        self._cell_text.delete("1.0", tk.END)
+        self._cell_text.insert(tk.END, text)
+        self._building = False
 
 
 class StatsFrame(tk.Frame):
@@ -912,7 +1010,17 @@ class FormatBar(tk.Frame):
             variable=self._italic_var,
             command=self._on_change,
         )
-        self._italic_check.pack(side=tk.LEFT, padx=(0, 6))
+        self._italic_check.pack(side=tk.LEFT, padx=(0, 4))
+
+        # ── Underline ───────────────────────────────────────────────────────
+        self._underline_var = tk.BooleanVar(value=False)
+        self._underline_check = ttk.Checkbutton(
+            self,
+            text="Underline",
+            variable=self._underline_var,
+            command=self._on_change,
+        )
+        self._underline_check.pack(side=tk.LEFT, padx=(0, 6))
 
         # ── Цвет текста ────────────────────────────────────────────────────
         tk.Label(self, text="Цвет:").pack(side=tk.LEFT, padx=(0, 2))
@@ -939,6 +1047,7 @@ class FormatBar(tk.Frame):
             font_size = 11
         bold = self._bold_var.get()
         italic = self._italic_var.get()
+        underline = self._underline_var.get()
         color = self._color_value
 
         delta = CellDelta(
@@ -947,6 +1056,7 @@ class FormatBar(tk.Frame):
             font_size=font_size,
             bold=bold,
             italic=italic,
+            underline=underline,
             color=color if color else None,
         )
         self._on_format_change(delta)
@@ -972,19 +1082,21 @@ class FormatBar(tk.Frame):
                 self._size_var.set("11")
                 self._bold_var.set(False)
                 self._italic_var.set(False)
+                self._underline_var.set(False)
                 self._color_value = ""
-                self._color_btn.config(bg="SystemButtonFace")
+                self._color_btn.config(bg="#d9d9d9")
             else:
                 self._font_var.set(cell_data.font_name or "")
                 self._size_var.set(str(cell_data.font_size) if cell_data.font_size else "11")
                 self._bold_var.set(cell_data.bold)
                 self._italic_var.set(cell_data.italic)
+                self._underline_var.set(cell_data.underline)
                 color = cell_data.color or ""
                 self._color_value = color
                 try:
-                    self._color_btn.config(bg=color if color else "SystemButtonFace")
+                    self._color_btn.config(bg=color if color else "#d9d9d9")
                 except tk.TclError:
-                    self._color_btn.config(bg="SystemButtonFace")
+                    self._color_btn.config(bg="#d9d9d9")
         finally:
             self._updating = False
 
@@ -1058,7 +1170,9 @@ class EditorFrame(tk.Frame):
     """
 
     _MODIFIED_TAG = "modified"
-    _MODIFIED_BG = "#FFF3CD"   # светло-жёлтый фон для изменённых ячеек
+    _MODIFIED_BG = "#FFF3CD"
+    _ROW_SEL_TAG = "row_sel"
+    _ROW_SEL_BG = "#D6E4F0"
 
     def __init__(
         self,
@@ -1070,17 +1184,15 @@ class EditorFrame(tk.Frame):
         super().__init__(parent, **kwargs)
         self._state = state
         self._on_close = on_close
-        self._active_cell: tuple[int, int] | None = None  # (row_idx, col_idx)
+        self._active_cell: tuple[int, int] | None = None
         self._entry_widget: tk.Entry | None = None
-        self._col_ids: list[str] = []   # Treeview column identifiers
-        self._row_iids: list[str] = []  # Treeview item iids (one per data row)
+        self._col_ids: list[str] = []
+        self._row_iids: list[str] = []
+        self._cell_indicator: tk.Frame | None = None
         self._build_ui()
         self._load_data()
 
-    # ── Построение UI ──────────────────────────────────────────────────────
-
     def _build_ui(self) -> None:
-        # ── Верхняя панель: имя файла ──────────────────────────────────────
         top = tk.Frame(self)
         top.pack(fill=tk.X, padx=8, pady=(8, 2))
 
@@ -1091,15 +1203,23 @@ class EditorFrame(tk.Frame):
         )
         tk.Label(top, text=f"Редактирование: {file_name}", font=("", 10, "bold")).pack(side=tk.LEFT)
 
-        # ── FormatBar ──────────────────────────────────────────────────────
         self._format_bar = FormatBar(self, on_format_change=self._apply_format)
         self._format_bar.pack(fill=tk.X, padx=8, pady=(2, 4))
 
-        # ── Таблица (Treeview + скроллбары) ───────────────────────────────
         table_frame = tk.Frame(self)
         table_frame.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 4))
 
-        self._tree = ttk.Treeview(table_frame, show="headings", selectmode="browse")
+        tree_style = ttk.Style()
+        tree_style.configure("Editor.Treeview", rowheight=24, borderwidth=1,
+                             relief="solid")
+        tree_style.configure("Editor.Treeview.Heading", borderwidth=1, relief="solid")
+        tree_style.map("Editor.Treeview",
+                       background=[("selected", self._ROW_SEL_BG)])
+
+        self._tree = ttk.Treeview(
+            table_frame, show="headings", selectmode="browse",
+            style="Editor.Treeview",
+        )
         vsb = ttk.Scrollbar(table_frame, orient=tk.VERTICAL, command=self._tree.yview)
         hsb = ttk.Scrollbar(table_frame, orient=tk.HORIZONTAL, command=self._tree.xview)
         self._tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
@@ -1108,45 +1228,39 @@ class EditorFrame(tk.Frame):
         hsb.pack(side=tk.BOTTOM, fill=tk.X)
         self._tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
-        # Тег для изменённых ячеек
         self._tree.tag_configure(self._MODIFIED_TAG, background=self._MODIFIED_BG)
+        self._tree.tag_configure(self._ROW_SEL_TAG, background=self._ROW_SEL_BG)
 
-        # Привязки событий
         self._tree.bind("<Double-1>", self._on_double_click)
         self._tree.bind("<<TreeviewSelect>>", self._on_select)
+        self._tree.bind("<ButtonRelease-1>", self._on_click_release, add="+")
 
-        # ── Нижняя панель: кнопки действий ────────────────────────────────
+        bp = self._find_bottom_panel()
+        if bp:
+            bp.set_cell_text_callback(self._save_cell_text_from_bar)
+
         bottom = tk.Frame(self)
         bottom.pack(fill=tk.X, padx=8, pady=(0, 8))
 
-        # Кнопки действий
         self._btn_save = tk.Button(
-            bottom,
-            text="Сохранить этот файл",
-            state=tk.DISABLED,
-            command=self._on_save,
+            bottom, text="Сохранить этот файл",
+            state=tk.DISABLED, command=self._on_save,
         )
         self._btn_save.pack(side=tk.LEFT, padx=(0, 6))
 
         self._btn_apply_all = tk.Button(
-            bottom,
-            text="Применить ко всем однотипным ODS",
-            state=tk.DISABLED,
-            command=self._on_apply_all,
+            bottom, text="Применить ко всем однотипным ODS",
+            state=tk.DISABLED, command=self._on_apply_all,
         )
         self._btn_apply_all.pack(side=tk.LEFT, padx=(0, 6))
 
         self._btn_close = tk.Button(
-            bottom,
-            text="Закрыть файл / Вернуться к статистике",
+            bottom, text="Закрыть файл / Вернуться к статистике",
             command=self._on_close_editor,
         )
         self._btn_close.pack(side=tk.RIGHT)
 
-    # ── Загрузка данных ────────────────────────────────────────────────────
-
     def _load_data(self) -> None:
-        """Загрузить SheetData из state и заполнить Treeview."""
         sheet = self._state.sheet_data
         if sheet is None:
             return
@@ -1154,7 +1268,6 @@ class EditorFrame(tk.Frame):
         max_col = sheet.max_col
         max_row = sheet.max_row
 
-        # Формируем идентификаторы столбцов: A, B, C, ... Z, AA, AB, ...
         self._col_ids = [self._col_letter(c) for c in range(max_col + 1)]
 
         self._tree["columns"] = self._col_ids
@@ -1162,7 +1275,6 @@ class EditorFrame(tk.Frame):
             self._tree.heading(col_id, text=col_id)
             self._tree.column(col_id, width=80, minwidth=40, stretch=True)
 
-        # Заполняем строки
         self._row_iids = []
         for r in range(max_row + 1):
             values = []
@@ -1172,12 +1284,10 @@ class EditorFrame(tk.Frame):
             iid = self._tree.insert("", tk.END, values=values)
             self._row_iids.append(iid)
 
-        # Применяем теги для уже изменённых ячеек (если дельта не пуста)
-        self._refresh_modified_tags()
+        self._refresh_row_tags()
 
     @staticmethod
     def _col_letter(col_idx: int) -> str:
-        """Преобразует индекс столбца (0-based) в буквенное обозначение (A, B, ..., Z, AA, ...)."""
         result = ""
         n = col_idx
         while True:
@@ -1187,73 +1297,160 @@ class EditorFrame(tk.Frame):
                 break
         return result
 
-    # ── Обновление тегов изменённых ячеек ─────────────────────────────────
+    def _get_cell_data_for_display(self, row_idx: int, col_idx: int) -> CellData | None:
+        delta = self._state.delta.get(row_idx, col_idx)
+        sheet = self._state.sheet_data
+        if delta is not None:
+            orig = sheet.cells.get((row_idx, col_idx)) if sheet else None
+            return CellData(
+                value=delta.value if delta.value is not None else (orig.value if orig else ""),
+                font_name=delta.font_name if delta.font_name is not None else (orig.font_name if orig else ""),
+                font_size=delta.font_size if delta.font_size is not None else (orig.font_size if orig else 11),
+                bold=delta.bold if delta.bold is not None else (orig.bold if orig else False),
+                italic=delta.italic if delta.italic is not None else (orig.italic if orig else False),
+                underline=delta.underline if delta.underline is not None else (orig.underline if orig else False),
+                color=delta.color if delta.color is not None else (orig.color if orig else ""),
+            )
+        elif sheet:
+            return sheet.cells.get((row_idx, col_idx))
+        return None
 
-    def _refresh_modified_tags(self) -> None:
-        """Перекрасить строки, содержащие изменённые ячейки."""
-        # Собираем строки, в которых есть изменения
+    def _refresh_row_tags(self) -> None:
         modified_rows: set[int] = set()
         for (row, _col), _delta in self._state.delta.items():
             modified_rows.add(row)
 
+        sel_row = -1
+        selection = self._tree.selection()
+        if selection:
+            sel_iid = selection[0]
+            if sel_iid in self._row_iids:
+                sel_row = self._row_iids.index(sel_iid)
+
         for r, iid in enumerate(self._row_iids):
+            tags = []
             if r in modified_rows:
-                self._tree.item(iid, tags=(self._MODIFIED_TAG,))
-            else:
-                self._tree.item(iid, tags=())
+                tags.append(self._MODIFIED_TAG)
+            if r == sel_row:
+                tags.append(self._ROW_SEL_TAG)
+            self._tree.item(iid, tags=tuple(tags))
 
-    # ── Редактирование ячейки ──────────────────────────────────────────────
+    # ── Cell indicator overlay ────────────────────────────────────────────
 
-    def _on_double_click(self, event: tk.Event) -> None:
-        """Двойной клик — перевести ячейку в режим редактирования."""
+    def _show_cell_indicator(self, iid: str, col_idx: int) -> None:
+        self._hide_cell_indicator()
+        if col_idx >= len(self._col_ids):
+            return
+        bbox = self._tree.bbox(iid, column=self._col_ids[col_idx])
+        if not bbox:
+            return
+        x, y, w, h = bbox
+        self._cell_indicator = tk.Frame(
+            self._tree, bg="", highlightbackground="#3B7DD8", highlightthickness=2,
+        )
+        self._cell_indicator.place(x=x, y=y, width=w, height=h)
+
+    def _hide_cell_indicator(self) -> None:
+        if self._cell_indicator is not None:
+            try:
+                self._cell_indicator.destroy()
+            except tk.TclError:
+                pass
+            self._cell_indicator = None
+
+    # ── Click release — select cell (fires AFTER <<TreeviewSelect>>) ──────
+
+    def _on_click_release(self, event: tk.Event) -> None:
+        if self._entry_widget is not None:
+            return
+
         region = self._tree.identify_region(event.x, event.y)
         if region != "cell":
+            self._hide_cell_indicator()
             return
-        col_id = self._tree.identify_column(event.x)   # "#1", "#2", ...
+        col_id = self._tree.identify_column(event.x)
         iid = self._tree.identify_row(event.y)
         if not iid or not col_id:
             return
-
-        col_idx = int(col_id.lstrip("#")) - 1  # 0-based
+        col_idx = int(col_id.lstrip("#")) - 1
         row_idx = self._row_iids.index(iid) if iid in self._row_iids else -1
         if row_idx < 0:
             return
 
-        self._start_edit(iid, col_idx, row_idx)
-
-    def _start_edit(self, iid: str, col_idx: int, row_idx: int) -> None:
-        """Разместить Entry-виджет поверх ячейки для редактирования."""
-        # Завершить предыдущее редактирование, если есть
         self._finish_edit(save=True)
 
         self._active_cell = (row_idx, col_idx)
+        self._show_cell_indicator(iid, col_idx)
+        self._update_format_bar(row_idx, col_idx)
+        self._update_cell_text_tab(row_idx, col_idx)
+        self._refresh_row_tags()
 
-        # Получить текущее значение ячейки
-        values = self._tree.item(iid, "values")
-        current_value = values[col_idx] if col_idx < len(values) else ""
+    # ── Редактирование ячейки ──────────────────────────────────────────────
 
-        # Вычислить координаты ячейки в Treeview
-        bbox = self._tree.bbox(iid, column=self._col_ids[col_idx])
+    def _on_double_click(self, event: tk.Event) -> str | None:
+        region = self._tree.identify_region(event.x, event.y)
+        if region != "cell":
+            return "break"
+        col_id = self._tree.identify_column(event.x)
+        iid = self._tree.identify_row(event.y)
+        if not iid or not col_id:
+            return "break"
+
+        col_idx = int(col_id.lstrip("#")) - 1
+        row_idx = self._row_iids.index(iid) if iid in self._row_iids else -1
+        if row_idx < 0:
+            return "break"
+
+        self._start_edit(iid, col_idx, row_idx)
+        return "break"
+
+    def _start_edit(self, iid: str, col_idx: int, row_idx: int) -> None:
+        self._finish_edit(save=True)
+        self._hide_cell_indicator()
+
+        self._active_cell = (row_idx, col_idx)
+
+        cell_data = self._get_cell_data_for_display(row_idx, col_idx)
+        current_value = cell_data.value if cell_data and cell_data.value else ""
+        current_value_inline = current_value.replace("\n", " ")
+
+        col_str_id = f"#{col_idx + 1}"
+        bbox = self._tree.bbox(iid, column=col_str_id)
         if not bbox:
             return
         x, y, width, height = bbox
 
-        # Создать Entry поверх ячейки
-        entry = tk.Entry(self._tree)
+        entry = tk.Entry(self._tree, font=("TkDefaultFont", 10))
         entry.place(x=x, y=y, width=width, height=height)
-        entry.insert(0, current_value)
+        entry.insert(0, current_value_inline)
         entry.select_range(0, tk.END)
-        entry.focus_set()
 
-        self._entry_widget = entry
+        self._edit_guard_until = time.monotonic() + 0.3
 
         entry.bind("<Return>", lambda e: self._finish_edit(save=True))
         entry.bind("<Escape>", lambda e: self._finish_edit(save=False))
-        entry.bind("<FocusOut>", lambda e: self._finish_edit(save=True))
+        entry.bind("<FocusOut>", self._on_entry_focus_out)
         entry.bind("<Tab>", lambda e: self._finish_edit(save=True))
 
+        self._entry_widget = entry
+
+        entry.focus_set()
+        self.after(50, self._refocus_entry)
+
+    def _refocus_entry(self) -> None:
+        self._edit_guard_until = time.monotonic() + 0.3
+        if self._entry_widget is not None:
+            try:
+                self._entry_widget.focus_set()
+            except tk.TclError:
+                pass
+
+    def _on_entry_focus_out(self, event=None) -> None:
+        if time.monotonic() < self._edit_guard_until:
+            return
+        self._finish_edit(save=True)
+
     def _finish_edit(self, save: bool = True) -> None:
-        """Завершить редактирование ячейки."""
         if self._entry_widget is None:
             return
 
@@ -1271,8 +1468,6 @@ class EditorFrame(tk.Frame):
             pass
 
     def _save_cell_value(self, row_idx: int, col_idx: int, new_value: str) -> None:
-        """Сохранить новое значение ячейки в DeltaStore и обновить Treeview."""
-        # Получить существующую дельту или создать новую
         existing = self._state.delta.get(row_idx, col_idx)
         if existing is not None:
             delta = CellDelta(
@@ -1281,6 +1476,7 @@ class EditorFrame(tk.Frame):
                 font_size=existing.font_size,
                 bold=existing.bold,
                 italic=existing.italic,
+                underline=existing.underline,
                 color=existing.color,
             )
         else:
@@ -1290,11 +1486,11 @@ class EditorFrame(tk.Frame):
                 font_size=None,
                 bold=None,
                 italic=None,
+                underline=None,
                 color=None,
             )
         self._state.delta.set(row_idx, col_idx, delta)
 
-        # Обновить значение в Treeview
         if row_idx < len(self._row_iids):
             iid = self._row_iids[row_idx]
             values = list(self._tree.item(iid, "values"))
@@ -1302,20 +1498,19 @@ class EditorFrame(tk.Frame):
                 values[col_idx] = new_value
                 self._tree.item(iid, values=values)
 
-        # Обновить теги
-        self._refresh_modified_tags()
+        self._refresh_row_tags()
 
-        # Включить кнопки сохранения
         self._btn_save.config(state=tk.NORMAL)
         self._btn_apply_all.config(state=tk.NORMAL)
 
     # ── Выбор ячейки ──────────────────────────────────────────────────────
 
     def _on_select(self, event=None) -> None:
-        """Обработчик выбора строки — обновить FormatBar."""
         selection = self._tree.selection()
         if not selection:
             self._format_bar.load_cell(None)
+            self._hide_cell_indicator()
+            self._refresh_row_tags()
             return
         iid = selection[0]
         row_idx = self._row_iids.index(iid) if iid in self._row_iids else -1
@@ -1323,107 +1518,119 @@ class EditorFrame(tk.Frame):
             self._format_bar.load_cell(None)
             return
 
-        # Определяем активный столбец (если есть активная ячейка в этой строке)
         col_idx = 0
         if self._active_cell and self._active_cell[0] == row_idx:
             col_idx = self._active_cell[1]
 
         self._active_cell = (row_idx, col_idx)
         self._update_format_bar(row_idx, col_idx)
+        self._update_cell_text_tab(row_idx, col_idx)
+        self._refresh_row_tags()
 
     def _update_format_bar(self, row_idx: int, col_idx: int) -> None:
-        """Обновить FormatBar форматированием активной ячейки."""
-        # Сначала проверяем дельту
-        delta = self._state.delta.get(row_idx, col_idx)
-        sheet = self._state.sheet_data
-
-        if delta is not None:
-            # Строим CellData из дельты + исходных данных
-            orig = sheet.cells.get((row_idx, col_idx)) if sheet else None
-            cell_data = CellData(
-                value=delta.value if delta.value is not None else (orig.value if orig else ""),
-                font_name=delta.font_name if delta.font_name is not None else (orig.font_name if orig else ""),
-                font_size=delta.font_size if delta.font_size is not None else (orig.font_size if orig else 11),
-                bold=delta.bold if delta.bold is not None else (orig.bold if orig else False),
-                italic=delta.italic if delta.italic is not None else (orig.italic if orig else False),
-                color=delta.color if delta.color is not None else (orig.color if orig else ""),
-            )
-        elif sheet:
-            cell_data = sheet.cells.get((row_idx, col_idx))
-        else:
-            cell_data = None
-
+        cell_data = self._get_cell_data_for_display(row_idx, col_idx)
         self._format_bar.load_cell(cell_data)
+
+    def _update_cell_text_tab(self, row_idx: int, col_idx: int) -> None:
+        cell_data = self._get_cell_data_for_display(row_idx, col_idx)
+        if cell_data is None:
+            text = ""
+        else:
+            text = cell_data.value
+        bp = self._find_bottom_panel()
+        if bp:
+            bp.show_cell_content(text)
+
+    def _find_bottom_panel(self):
+        widget = self.master
+        while widget is not None:
+            if hasattr(widget, "_bottom_panel"):
+                return widget._bottom_panel
+            widget = getattr(widget, "master", None)
+        return None
+
+    def _save_cell_text_from_bar(self) -> None:
+        if self._active_cell is None:
+            return
+        bp = self._find_bottom_panel()
+        if not bp:
+            return
+        new_text = bp.get_cell_text()
+        row_idx, col_idx = self._active_cell
+        self._finish_edit(save=True)
+        self._save_cell_value(row_idx, col_idx, new_text)
 
     # ── Применение форматирования ──────────────────────────────────────────
 
     def _apply_format(self, format_delta: CellDelta) -> None:
-        """Применить форматирование к выделенным ячейкам."""
-        selection = self._tree.selection()
-        if not selection:
+        if not self._active_cell:
             return
 
-        for iid in selection:
-            row_idx = self._row_iids.index(iid) if iid in self._row_iids else -1
-            if row_idx < 0:
-                continue
+        row_idx, col_idx = self._active_cell
 
-            # Применяем ко всем столбцам строки или только к активному
-            col_idx = self._active_cell[1] if self._active_cell and self._active_cell[0] == row_idx else 0
+        existing = self._state.delta.get(row_idx, col_idx)
+        if existing is not None:
+            merged = CellDelta(
+                value=existing.value,
+                font_name=format_delta.font_name if format_delta.font_name is not None else existing.font_name,
+                font_size=format_delta.font_size if format_delta.font_size is not None else existing.font_size,
+                bold=format_delta.bold if format_delta.bold is not None else existing.bold,
+                italic=format_delta.italic if format_delta.italic is not None else existing.italic,
+                underline=format_delta.underline if format_delta.underline is not None else existing.underline,
+                color=format_delta.color if format_delta.color is not None else existing.color,
+            )
+        else:
+            merged = CellDelta(
+                value=None,
+                font_name=format_delta.font_name,
+                font_size=format_delta.font_size,
+                bold=format_delta.bold,
+                italic=format_delta.italic,
+                underline=format_delta.underline,
+                color=format_delta.color,
+            )
 
-            existing = self._state.delta.get(row_idx, col_idx)
-            if existing is not None:
-                merged = CellDelta(
-                    value=existing.value,
-                    font_name=format_delta.font_name if format_delta.font_name is not None else existing.font_name,
-                    font_size=format_delta.font_size if format_delta.font_size is not None else existing.font_size,
-                    bold=format_delta.bold if format_delta.bold is not None else existing.bold,
-                    italic=format_delta.italic if format_delta.italic is not None else existing.italic,
-                    color=format_delta.color if format_delta.color is not None else existing.color,
-                )
-            else:
-                merged = CellDelta(
-                    value=None,
-                    font_name=format_delta.font_name,
-                    font_size=format_delta.font_size,
-                    bold=format_delta.bold,
-                    italic=format_delta.italic,
-                    color=format_delta.color,
-                )
-            self._state.delta.set(row_idx, col_idx, merged)
+        self._state.delta.set(row_idx, col_idx, merged)
+        self._state.log.add(
+            f"Формат ячейки ({row_idx},{col_idx}): "
+            f"шрифт={merged.font_name} размер={merged.font_size} "
+            f"ж={merged.bold} к={merged.italic} п={merged.underline} ц={merged.color}"
+        )
 
-        self._refresh_modified_tags()
+        self._refresh_row_tags()
         self._btn_save.config(state=tk.NORMAL)
         self._btn_apply_all.config(state=tk.NORMAL)
+
+        self._update_format_bar(row_idx, col_idx)
+        self._update_cell_text_tab(row_idx, col_idx)
 
     # ── Кнопки действий ───────────────────────────────────────────────────
 
     def _on_save(self) -> None:
-        """Сохранить изменения в текущем файле."""
-        # Завершить активное редактирование перед сохранением
         self._finish_edit(save=True)
 
         if self._state.current_file is None:
             return
 
+        delta = self._state.delta
+        n_changes = sum(1 for _ in delta.items())
+        self._state.log.add(f"Сохранение файла: {self._state.current_file.path.name} ({n_changes} ячеек изменено)")
         processor = Processor()
         ok = processor.apply_and_save(
             self._state.current_file.path,
-            self._state.delta,
+            delta,
             self._state.log,
         )
 
         if ok:
+            self._state.log.add("Файл успешно сохранён")
             messagebox.showinfo("Сохранено", "Файл успешно сохранён.")
         else:
             messagebox.showerror("Ошибка", "Не удалось сохранить файл. Подробности в логе.")
 
-        # Обновить панель лога
-        self._refresh_log_panel()
+        self._refresh_bottom_panel()
 
     def _on_apply_all(self) -> None:
-        """Применить изменения ко всем файлам группы."""
-        # Завершить активное редактирование перед применением
         self._finish_edit(save=True)
 
         key = self._state.selected_group_key
@@ -1440,12 +1647,12 @@ class EditorFrame(tk.Frame):
         if not confirmed:
             return
 
-        # Показать ProgressDialog
+        self._state.log.add(f"Массовое применение: {n} файлов (группа {key} строк)")
+
         progress_dialog = ProgressDialog(self, total=n)
 
         def progress_callback(done: int, total: int) -> None:
             progress_dialog.update(done, total)
-            # Обновить UI во время обработки
             try:
                 self.update()
             except tk.TclError:
@@ -1461,8 +1668,8 @@ class EditorFrame(tk.Frame):
 
         progress_dialog.close()
 
-        # Показать итоговый отчёт
         if result.error_count == 0:
+            self._state.log.add(f"Массовое применение завершено: {result.success_count} файлов")
             summary = f"Успешно обновлено файлов: {result.success_count}."
         else:
             summary = (
@@ -1472,15 +1679,12 @@ class EditorFrame(tk.Frame):
             )
         messagebox.showinfo("Результат", summary)
 
-        # Обновить панель лога
-        self._refresh_log_panel()
+        self._refresh_bottom_panel()
 
     def _on_close_editor(self) -> None:
-        """Закрыть редактор и вернуться к статистике."""
-        # Завершить активное редактирование
         self._finish_edit(save=True)
+        self._hide_cell_indicator()
 
-        # Проверить наличие несохранённых изменений
         if not self._state.delta.is_empty():
             confirmed = messagebox.askyesno(
                 "Несохранённые изменения",
@@ -1491,22 +1695,17 @@ class EditorFrame(tk.Frame):
 
         self._on_close()
 
-    def _refresh_log_panel(self) -> None:
-        """Обновить LogPanel, если она доступна через родительское окно."""
-        # Поднимаемся по иерархии виджетов до MainWindow
-        widget = self.master
-        while widget is not None:
-            if hasattr(widget, "_log_panel"):
-                widget._log_panel.refresh()
-                return
-            widget = getattr(widget, "master", None)
+    def _refresh_bottom_panel(self) -> None:
+        bp = self._find_bottom_panel()
+        if bp:
+            bp.refresh_log()
 
 
 class MainWindow(tk.Tk):
     """
     Корневое окно приложения.
     Содержит StatsFrame или EditorFrame (переключение через pack/forget).
-    Внизу всегда отображается LogPanel.
+    Внизу всегда отображается BottomPanel с вкладками.
     """
 
     def __init__(self) -> None:
@@ -1515,7 +1714,6 @@ class MainWindow(tk.Tk):
         self.geometry("900x600")
         self.minsize(600, 400)
 
-        # Инициализация состояния
         target_folder = Path(__file__).resolve().parent
         self._state = AppState(
             target_folder=target_folder,
@@ -1533,15 +1731,15 @@ class MainWindow(tk.Tk):
 
         self._build_ui()
 
-        # Автоматическое сканирование при запуске
+        self._state.log.add("Приложение запущено")
         self._run_scan()
 
+        self.protocol("WM_DELETE_WINDOW", self._on_close_app)
+
     def _build_ui(self) -> None:
-        # Основная область (StatsFrame / EditorFrame)
         self._content_frame = tk.Frame(self)
         self._content_frame.pack(fill=tk.BOTH, expand=True)
 
-        # StatsFrame
         self._stats_frame = StatsFrame(
             self._content_frame,
             state=self._state,
@@ -1550,64 +1748,61 @@ class MainWindow(tk.Tk):
         )
         self._stats_frame.pack(fill=tk.BOTH, expand=True)
 
-        # Разделитель
         ttk.Separator(self, orient=tk.HORIZONTAL).pack(fill=tk.X)
 
-        # LogPanel внизу
-        self._log_panel = LogPanel(self, self._state.log)
-        self._log_panel.pack(fill=tk.BOTH, side=tk.BOTTOM)
+        self._bottom_panel = BottomPanel(self, self._state.log)
+        self._bottom_panel.pack(fill=tk.BOTH, side=tk.BOTTOM)
 
-    # ── Сканирование ───────────────────────────────────────────────────────
+    def _on_close_app(self) -> None:
+        self._state.log.add("Приложение закрывается")
+        self._state.log.close()
+        self.destroy()
 
     def _run_scan(self) -> None:
-        """Запустить сканирование целевой папки и обновить StatsFrame."""
         folder = self._state.target_folder
         if not folder.exists() or not folder.is_dir():
             self._state.log.add(f"Папка не существует: {folder}")
-            self._log_panel.refresh()
+            self._bottom_panel.refresh_log()
             self._state.scan_results = []
             self._state.groups = {}
             self._stats_frame.refresh()
             return
 
+        self._state.log.add(f"Сканирование папки: {folder}")
         self._state.scan_results = self._scanner.scan(folder, self._state.log)
         self._group_manager.build(self._state.scan_results)
         self._state.groups = self._group_manager.get_groups()
+        n_files = len(self._state.scan_results)
+        n_groups = len(self._state.groups)
+        self._state.log.add(f"Найдено файлов: {n_files}, групп: {n_groups}")
         self._stats_frame.refresh()
-        self._log_panel.refresh()
+        self._bottom_panel.refresh_log()
 
     def _on_folder_changed(self, new_folder: Path) -> None:
-        """Вызывается при смене целевой папки — запускает повторное сканирование."""
+        self._state.log.add(f"Смена папки: {new_folder}")
         self._run_scan()
 
-    # ── Переключение экранов ───────────────────────────────────────────────
-
     def _show_editor(self, file_info: "FileInfo") -> None:
-        """
-        Переключиться на EditorFrame для указанного файла.
-        Загружает файл через OdsReader, сохраняет SheetData в state,
-        скрывает StatsFrame и показывает EditorFrame.
-        """
         self._state.current_file = file_info
 
-        # Загрузить данные файла
+        self._state.log.add(f"Открытие файла: {file_info.path.name}")
         reader = OdsReader()
         try:
             sheet_data = reader.load(file_info.path)
         except Exception as e:
             self._state.log.add(f"Ошибка открытия файла {file_info.path.name}: {e}")
-            self._log_panel.refresh()
+            self._bottom_panel.refresh_log()
             messagebox.showerror("Ошибка", f"Не удалось открыть файл:\n{e}")
             return
 
         self._state.sheet_data = sheet_data
-        # Сбросить дельту при открытии нового файла
         self._state.delta.clear()
+        self._state.log.add(
+            f"Файл загружен: {sheet_data.max_row + 1} строк, {sheet_data.max_col + 1} столбцов"
+        )
 
-        # Скрыть StatsFrame
         self._stats_frame.pack_forget()
 
-        # Создать и показать EditorFrame
         self._editor_frame = EditorFrame(
             self._content_frame,
             state=self._state,
@@ -1616,21 +1811,14 @@ class MainWindow(tk.Tk):
         self._editor_frame.pack(fill=tk.BOTH, expand=True)
 
     def show_stats(self) -> None:
-        """
-        Вернуться на StatsFrame (вызывается из EditorFrame).
-        Скрывает EditorFrame и показывает StatsFrame без повторного сканирования.
-        """
-        # Скрыть EditorFrame, если он существует
         if hasattr(self, "_editor_frame") and self._editor_frame is not None:
             self._editor_frame.pack_forget()
             self._editor_frame.destroy()
             self._editor_frame = None
 
-        # Сбросить состояние редактора
         self._state.current_file = None
         self._state.sheet_data = None
 
-        # Показать StatsFrame
         self._stats_frame.pack(fill=tk.BOTH, expand=True)
 
 
@@ -1639,4 +1827,7 @@ class MainWindow(tk.Tk):
 # ===========================================================================
 
 if __name__ == "__main__":
-    MainWindow().mainloop()
+    _check_deps_and_install()
+    app = MainWindow()
+    app.mainloop()
+    app._state.log.close()

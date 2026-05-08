@@ -7,9 +7,8 @@
 ## Запуск
 
 ```bash
-python3 tableredr.py
+sudo bash tablered.sh
 ```
-
 
 ## Что умеет
 

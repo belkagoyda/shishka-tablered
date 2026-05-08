@@ -1,38 +1,15 @@
-# ODS Bulk Editor
+# tablered
 
 Десктоп-приложение на Python/tkinter для массового редактирования `.ods`-файлов.
 
 Открываешь один файл-образец, редактируешь значения ячеек и форматирование — и применяешь те же правки ко всем файлам группы одним нажатием кнопки. Файлы группируются по количеству строк с данными на первом листе.
 
-## Установка зависимостей
-
-```bash
-sudo bash install_deps.sh
-```
-
-Устанавливает: `python3`, `python3-tk`, `python3-odf`
-
 ## Запуск
 
 ```bash
-python3 ods_bulk_editor.py
+python3 tableredr.py
 ```
 
-Или через скрипт-запускалку (двойной клик в файловом менеджере):
-
-```bash
-chmod +x launcher.sh
-./launcher.sh
-```
-
-> Требуется графическая сессия (X11/Wayland). Не работает по SSH без X-forwarding.
-
-## Тесты
-
-```bash
-pip install hypothesis pytest
-pytest tests/
-```
 
 ## Что умеет
 

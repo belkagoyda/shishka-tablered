@@ -10,7 +10,7 @@ tablered
 Группировка файлов производится по количеству строк с данными на первом листе.
 
 Зависимости: python3, python3-tk, python3-odf (odfpy)
-Запуск: python3 ods_bulk_editor.py
+Запуск: python3 tablered.py
 """
 
 from __future__ import annotations
